@@ -5,7 +5,11 @@ import pickle
 import re
 import pandas
 import json
+from pymongo import MongoClient
+import numpy
 from bs4 import BeautifulSoup
+from config_local_mongo import host, port
+from pprint import pprint
 
 
 class SuperJobParser:
@@ -84,10 +88,6 @@ class SuperJobParser:
                         'class': '_1OuF_ _1qw9T f-test-text-company-item-salary'})
                     match = re.fullmatch(r'(\D+)', salary_info.text)
                     if match:
-                        vacancy_data['min_salary'] = None
-                        vacancy_data['max_salary'] = None
-                        vacancy_data['currency'] = None
-                        vacancy_data['period'] = None
                         vacancy_data['description'] = match.group(0)
                     else:
                         vacancy_salary = "".join(
@@ -96,38 +96,31 @@ class SuperJobParser:
                         match = re.fullmatch(r'(\d+)\D(\d+)\s*(\w+.)\D(\w+)',
                                              vacancy_salary)
                         if match:
-                            vacancy_data['min_salary'] = match.group(1)
-                            vacancy_data['max_salary'] = match.group(2)
+                            vacancy_data['min_salary'] = int(match.group(1))
+                            vacancy_data['max_salary'] = int(match.group(2))
                             vacancy_data['currency'] = match.group(3)
                             vacancy_data['period'] = match.group(4)
-                            vacancy_data['description'] = None
                         else:
                             match = re.fullmatch(
                                 r'(\D+)\s*(\d+)\s*(\w+.)\D(\w+)',
                                 vacancy_salary)
                             if match:
                                 if match.group(1) == 'от':
-                                    vacancy_data['min_salary'] = match.group(2)
-                                    vacancy_data['max_salary'] = None
+                                    vacancy_data['min_salary'] = int(match.group(2))
                                     vacancy_data['currency'] = match.group(3)
                                     vacancy_data['period'] = match.group(4)
-                                    vacancy_data['description'] = None
-
                                 elif match.group(1) == 'до':
-                                    vacancy_data['min_salary'] = None
-                                    vacancy_data['max_salary'] = match.group(2)
+                                    vacancy_data['max_salary'] = int(match.group(2))
                                     vacancy_data['currency'] = match.group(3)
                                     vacancy_data['period'] = match.group(4)
-                                    vacancy_data['description'] = None
                             else:
                                 match = re.fullmatch(r'(\d+)\s*(\w+.)\D(\w+)',
                                                      vacancy_salary)
                                 if match:
-                                    vacancy_data['min_salary'] = match.group(1)
-                                    vacancy_data['max_salary'] = match.group(1)
+                                    vacancy_data['min_salary'] = int(match.group(1))
+                                    vacancy_data['max_salary'] = int(match.group(1))
                                     vacancy_data['currency'] = match.group(2)
                                     vacancy_data['period'] = match.group(3)
-                                    vacancy_data['description'] = None
                     vacancies_summary.append(vacancy_data)
 
             is_last_page = soup.find('a', attrs={'class':
@@ -140,14 +133,66 @@ class SuperJobParser:
         return vacancies_summary
 
     @staticmethod
-    def save_pickle(file_object, file_path):
+    def save_pickle(parse_object, file_path):
         with open(file_path, 'wb') as file:
-            pickle.dump(file_object, file)
+            pickle.dump(parse_object, file)
 
     @staticmethod
     def load_pickle(file_path):
         with open(file_path, 'rb') as file:
             return pickle.load(file)
+
+    @staticmethod
+    def save_to_csv(parse_object, file_path):
+        frame = pandas.DataFrame.from_records(parse_object)
+        frame.to_csv(path_or_buf=file_path, index=True)
+
+    @staticmethod
+    def save_to_mongo(parse_object, db_name, db_collection, db_host=None, db_port=None):
+        with MongoClient(host=db_host, port=db_port) as client:
+            db = client[db_name]
+            db.get_collection(db_collection).insert_many(parse_object)
+
+    @staticmethod
+    def update_mongo(parse_object, db_name, db_collection, db_host=None, db_port=None):
+        with MongoClient(host=db_host, port=db_port) as client:
+            db = client[db_name]
+            for vacancy in parse_object:
+                db.get_collection(db_collection).update_one({
+                    'vacancy_link': vacancy['vacancy_link']}, {'$set': vacancy},
+                    upsert=True)
+
+    @staticmethod
+    def mongo_find(db_name, db_collection, db_host=None, db_port=None):
+        choice = int(
+            input('1. Find vacancies with salary more than limit.\n'
+                  '2. Find vacancies without salary specified. '))
+
+        with MongoClient(host=db_host, port=db_port) as client:
+            db = client[db_name]
+            if choice == 1:
+                salary = int(input('Please input salary more than limit '))
+                vacancies = db.get_collection(db_collection).find(
+                    {'$or': [
+                        {
+                            'max_salary': {'$gte': salary}
+                        },
+                        {
+                            'min_salary': {'$gte': salary},
+                            'max_salary': numpy.nan
+                        }
+                    ]})
+            elif choice == 2:
+                vacancies = db.get_collection('super_job').find(
+                    {
+                        'min_salary': numpy.nan,
+                        'max_salary': numpy.nan
+                    })
+            else:
+                'Please input correct number'
+
+            for vacancy in vacancies:
+                pprint(vacancy)
 
 
 if __name__ == "__main__":
@@ -159,6 +204,9 @@ if __name__ == "__main__":
 
     path = "hw_super_job.rsp"
 
+    mongo_db = "vacancies"
+    collection_name = 'super_job'
+
     search_word = input('Type of keyword to search: ')
 
     hh_parser = SuperJobParser(start_url=url, sleep=1, key_word=search_word,
@@ -166,6 +214,11 @@ if __name__ == "__main__":
 
     result = hh_parser.parse()
     df = pandas.DataFrame(result)
+    df = df.where(pandas.notnull(df), None)
+    data = df.to_dict(orient='records')
 
-    with open("vacancies.json", "w") as json_file:
+    hh_parser.update_mongo(data, mongo_db, collection_name, host, port)
+    hh_parser.mongo_find(mongo_db, collection_name, host, port)
+
+    with open("super_job_data.json", "w") as json_file:
         json.dump(result, json_file, indent=2, ensure_ascii=False)
